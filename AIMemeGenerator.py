@@ -3,19 +3,21 @@
 # Creates start-to-finish memes using various AI service APIs. OpenAI's chatGPT to generate the meme text and image prompt, and several optional image generators for the meme picture. Then combines the meme text and image into a meme using Pillow.
 # Author: ThioJoe
 # Project Page: https://github.com/ThioJoe/Full-Stack-AI-Meme-Generator
-version = "1.0.4"
+version = "1.0.5"
 
 # Import installed libraries
+from gc import get_count
 import openai
 from stability_sdk import client
 import stability_sdk.interfaces.gooseai.generation.generation_pb2 as generation
+from PIL import Image, ImageDraw, ImageFont
+import requests
 
 # Import standard libraries
-import requests
+
 import warnings
 import re
 from base64 import b64decode
-from PIL import Image, ImageDraw, ImageFont
 from pkg_resources import parse_version
 from collections import namedtuple
 import io
@@ -29,7 +31,17 @@ import argparse
 import configparser
 import platform
 import shutil
+import traceback
+from PIL import Image, ImageDraw, ImageFont
+apiKeys = {
+    "openai_api_key": None,
+    # Add other API keys if needed
+}
 
+basic_instructions = "Basic instructions for meme generation."
+image_special_instructions = "Special instructions for image generation."
+
+noUserInput = False  # Change this according to your application logic
 # =============================================== Argument Parser ================================================
 # Parse the arguments at the start of the script
 parser = argparse.ArgumentParser()
@@ -265,7 +277,7 @@ def validate_api_keys(apiKeys, image_platform):
 
 def initialize_api_clients(apiKeys, image_platform):
     if apiKeys.openai_key:
-        openai.api_key = apiKeys.openai_key
+        openai_api = openai.OpenAI(api_key=apiKeys.openai_key)
 
     if apiKeys.stability_key and image_platform == "stability":
         stability_api = client.StabilityInference(
@@ -279,7 +291,7 @@ def initialize_api_clients(apiKeys, image_platform):
         stability_api = None
     
     # Only need to return stability_api because openai.api_key has global scope
-    return stability_api
+    return stability_api, openai_api
 
 
 # =============================================== Functions ================================================
@@ -451,12 +463,12 @@ def parse_meme(message):
         return None
     
 # Sends the user message to the chat bot and returns the chat bot's response
-def send_and_receive_message(text_model, userMessage, conversationTemp, temperature=0.5):
+def send_and_receive_message(openai_api, text_model, userMessage, conversationTemp, temperature=0.5):
     # Prepare to send request along with context by appending user message to previous conversation
     conversationTemp.append({"role": "user", "content": userMessage})
     
     print("Sending request to write meme...")
-    chatResponse = openai.ChatCompletion.create(
+    chatResponse = openai_api.chat.completions.create(
         model=text_model,
         messages=conversationTemp,
         temperature=temperature
@@ -536,11 +548,11 @@ def create_meme(image_path, top_text, filePath, fontFile, noFileSave=False, min_
     return virtualMemeFile
     
 
-def image_generation_request(apiKeys, image_prompt, platform, stability_api=None):
+def image_generation_request(apiKeys, image_prompt, platform, openai_api, stability_api=None):
     if platform == "openai":
-        openai_response = openai.Image.create(prompt=image_prompt, n=1, size="512x512", response_format="b64_json")
+        openai_response = openai_api.images.generate(model="dall-e-3", prompt=image_prompt, n=1, size="1024x1024", response_format="b64_json")
         # Convert image data to virtual file
-        image_data = b64decode(openai_response["data"][0]["b64_json"])
+        image_data = b64decode(openai_response.data[0].model_dump()["b64_json"])
         virtual_image_file = io.BytesIO()
         # Write the image data to the virtual file
         virtual_image_file.write(image_data)
@@ -588,8 +600,22 @@ def image_generation_request(apiKeys, image_prompt, platform, stability_api=None
 # ==================== RUN ====================
 
 # Set default values for parameters to those at top of script, but can be overridden by command line arguments or by being set when called from another script
+import os
+import sys
+import openai  # Assuming OpenAI library is used for text generation
+
+import openai
+#from packaging.version import parse as parse_version
+
+# Define the function to initialize API clients
+def initialize_api_clients(apiKeys, image_platform):
+    # Set OpenAI API key
+    openai.api_key = apiKeys.openai_key
+    # Initialize stability API if needed
+    stability_api = None  # Replace this with actual stability API initialization
+    return stability_api, openai
 def generate(
-    text_model="gpt-4",
+    text_model="gpt-3.5-turbo",
     temperature=1.0,
     basic_instructions=r'You will create funny memes that are clever and original, and not cliche or lame.',
     image_special_instructions=r'The images should be photographic.',
@@ -606,10 +632,9 @@ def generate(
     noFileSave=False,
     release_channel="all"
 ):
-    
-    # Load default settings from settings.ini file. Will be overridden by command line arguments, or ignored if Use_This_Config is set to False
+    # Load default settings from settings.ini file
     settings = get_settings()
-    use_config = settings.get('Use_This_Config', False) # If set to False, will ignore the settings.ini file
+    use_config = settings.get('Use_This_Config', False)
     if use_config:
         text_model = settings.get('Text_Model', text_model)
         temperature = float(settings.get('Temperature', temperature))
@@ -624,125 +649,216 @@ def generate(
     # Parse the arguments
     args = parser.parse_args()
 
-    # If API Keys not provided as parameters, get them from config file or command line arguments
+    # Handle API Keys
     if not openai_key:
         apiKeys = get_api_keys(args=args)
     else:
         apiKeys = ApiKeysTupleClass(openai_key, clipdrop_key, stability_key)
         
-    # Validate api keys
+    # Validate API keys and initialize clients
     validate_api_keys(apiKeys, image_platform)
-    # Initialize api clients. Only get stability_api object back because openai.api_key has global scope
-    stability_api = initialize_api_clients(apiKeys, image_platform)
+    stability_api, openai_api = initialize_api_clients(apiKeys, image_platform)
 
-    # Check if any settings arguments, and replace the default values with the args if so. To run automated from command line, specify at least 1 argument.
-    if args.imageplatform:
-        image_platform = args.imageplatform
-    if args.temperature:
-        temperature = float(args.temperature)
-    if args.basicinstructions:
-        basic_instructions = args.basicinstructions
-    if args.imagespecialinstructions:
-        image_special_instructions = args.imagespecialinstructions
-    if args.nofilesave:
-        noFileSave=True
-    if args.nouserinput:
-        noUserInput=True
+    # Update settings based on command line arguments
+    update_settings(args, locals())
 
     systemPrompt = construct_system_prompt(basic_instructions, image_special_instructions)
     conversation = [{"role": "system", "content": systemPrompt}]
 
-    # Get full path of font file from font file name
-    try:
-        font_file = check_font(font_file)
-    except NoFontFileError as fx:
-        print(f"\n  ERROR:  {fx}")
-        if not noUserInput:
-            input("\nPress Enter to exit...")
-        sys.exit()
-    
+    # Get full path of font file
+    font_file = get_font_file(font_file)
+
     # Check for updates
-    if not noUserInput:
-        if release_channel.lower() == "all" or release_channel.lower() == "stable":
-            updateAvailable = check_for_update(version, release_channel, silentCheck=False)
-            if updateAvailable:
-                input("\nPress Enter to continue...")
-                
+    check_for_updates(release_channel, noUserInput)
+
     # Clear console
     os.system('cls' if os.name == 'nt' else 'clear')
 
-    # ---------- Start User Input -----------
     # Display Header
-    print(f"\n==================== AI Meme Generator - {version} ====================")
+    print(f"\n==================== AI Meme Generator ====================")
 
-    if noUserInput:
-        userEnteredPrompt = user_entered_prompt
-        meme_count = meme_count # Use default set in function parameter (1)
-    
-    # If any arguments are being used (or set to true for store_true arguments), skip the user input and use the arguments or defaults
-    else:
-        # If no user prompt argument set, get user input for prompt
-        if not args.userprompt:
-            print("\nEnter a meme subject or concept (Or just hit enter to let the AI decide)")
-            userEnteredPrompt = input(" >  ")
-            if not userEnteredPrompt: # If user puts in nothing, set to "anything"
-                userEnteredPrompt = "anything"
-        else:
-            userEnteredPrompt = args.userprompt
-        
-        # If no meme count argument set, get user input for meme count
-        if not args.memecount:
-            # Set the number of memes to create
-            meme_count = 1 # Default will be none if nothing entered
-            print("\nEnter the number of memes to create (Or just hit Enter for 1): ")
-            userEnteredCount = input(" >  ")
-            if userEnteredCount:
-                meme_count = int(userEnteredCount)
-        else:
-            meme_count = int(args.memecount)
+    userEnteredPrompt = get_user_prompt(args, user_entered_prompt, noUserInput)
+    meme_count = get_meme_count(args, noUserInput)
+
+    # ---------- Start Meme Generation ----------- 
+    for i in range(meme_count):
+        try:
+            # Generate meme text
+            meme_text = generate_meme_text(openai_api, basic_instructions, userEnteredPrompt, text_model, temperature)
+
+            # Generate meme image
+            meme_image = generate_meme_image(stability_api, meme_text, image_special_instructions)
+
+            # Save meme
+            if not noFileSave:
+                save_meme(meme_image, output_folder, f"{base_file_name}_{i+1}.png")
             
+            print(f"Meme {i+1} generated successfully.")
+        except Exception as e:
+            print(f"Error generating meme {i+1}: {e}")
+
+def update_settings(args, local_vars):
+    if args.imageplatform:
+        local_vars['image_platform'] = args.imageplatform
+    if args.temperature:
+        local_vars['temperature'] = float(args.temperature)
+    if args.basicinstructions:
+        local_vars['basic_instructions'] = args.basicinstructions
+    if args.imagespecialinstructions:
+        local_vars['image_special_instructions'] = args.imagespecialinstructions
+    if args.nofilesave:
+        local_vars['noFileSave'] = True
+    if args.nouserinput:
+        local_vars['noUserInput'] = True
+
+def get_font_file(font_file):
+    try:
+        return check_font(font_file)
+    except NoFontFileError as fx:
+        print(f"\n  ERROR:  {fx}")
+        input("\nPress Enter to exit...")
+        sys.exit()
+
+def check_for_updates(release_channel, noUserInput):
+    if not noUserInput:
+        if release_channel.lower() in ["all", "stable"]:
+            updateAvailable = check_for_update(version, release_channel, silentCheck=False)
+            if updateAvailable:
+                input("\nPress Enter to continue...")
+
+def get_user_prompt(args, default_prompt, noUserInput):
+    if noUserInput:
+        return default_prompt
+
+    userEnteredPrompt = args.userprompt if args.userprompt else input("\nEnter a meme subject or concept (Or just hit enter to let the AI decide): ") or "anything"
+    return userEnteredPrompt
+
+def get_meme_count(args, noUserInput):
+    if noUserInput:
+        return args.memecount if args.memecount else 1
+
+    userEnteredCount = input("\nEnter the number of memes to create (Or just hit Enter for 1): ")
+    return int(userEnteredCount) if userEnteredCount else 1
+
+def generate_meme_text(api, instructions, prompt, model, temperature):
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=temperature
+    )
+    return response['choices'][0]['message']['content'].strip()
+
+def generate_meme_image(api_client, meme_text, special_instructions):
+    # Generate image using the stability API (or your preferred image generation API)
+    image_response = api_client.generate_image(prompt=meme_text + " " + special_instructions)
+    return image_response  # Assuming it returns an image object
+
+def save_meme(image, output_folder, filename):
+    # Save the image to the specified output folder
+    image.save(os.path.join(output_folder, filename))  # Assuming image is a PIL image object
+
+# Example of how to call the function
+generate(meme_count=5)  # Adjust parameters as needed
+
     # ----------------------------------------------------------------------------------------------------
+from PIL import Image, ImageDraw, ImageFont
 
-    def single_meme_generation_loop():
-        # Send request to chat bot to generate meme text and image prompt
-        chatResponse = send_and_receive_message(text_model, userEnteredPrompt, conversation, temperature)
-
-        # Take chat message and convert to dictionary with meme_text and image_prompt
-        memeDict = parse_meme(chatResponse)
-        image_prompt = memeDict['image_prompt']
-        meme_text = memeDict['meme_text']
-
-        # Print the meme text and image prompt
-        print("\n   Meme Text:  " + meme_text)
-        print("   Image Prompt:  " + image_prompt)
-
-        # Send image prompt to image generator and get image back (Using DALL·E API)
-        print("\nSending image creation request...")
-        virtual_image_file = image_generation_request(apiKeys, image_prompt, image_platform, stability_api)
-
-        # Combine the meme text and image into a meme
-        filePath,fileName = set_file_path(base_file_name, output_folder)
-        virtualMemeFile = create_meme(virtual_image_file, meme_text, filePath, noFileSave=noFileSave,fontFile=font_file)
-        if not noFileSave:
-            # Write the user message, meme text, and image prompt to a log file
-            write_log_file(userEnteredPrompt, memeDict, filePath, output_folder, basic_instructions, image_special_instructions, image_platform)
-        
-        absoluteFilePath = os.path.abspath(filePath)
-        
-        return {"meme_text": meme_text, "image_prompt": image_prompt, "file_path": absoluteFilePath, "virtual_meme_file": virtualMemeFile, "file_name": fileName}
+def add_watermark(image, watermark_text="MyMeme", position=(0, 0), font_path="arial.ttf", font_size=30):
+    # Load the image
+    draw = ImageDraw.Draw(image)
     
-    # ----------------------------------------------------------------------------------------------------
+    # Load the font
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except IOError:
+        font = ImageFont.load_default()  # Use default font if custom font is not found
 
-    # Create list of dictionaries to hold the results of each meme so that they can be returned by main() if called from command line
+    # Get the size of the watermark text
+    text_width, text_height = draw.textsize(watermark_text, font)
+    
+    # Calculate the position to place the watermark (bottom-right corner with padding)
+    x = image.width - text_width - 10  # 10 pixels from the right
+    y = image.height - text_height - 10  # 10 pixels from the bottom
+    
+    # Add watermark to the image
+    draw.text((x, y), watermark_text, font=font, fill=(255, 255, 255, 128))  # White text with transparency
+
+    return image
+
+def single_meme_generation_loop(openai_api, text_model, userEnteredPrompt, conversation, temperature, 
+                                 image_platform, stability_api, base_file_name, output_folder, 
+                                 noFileSave, font_file, watermark_text):
+    # Send request to chat bot to generate meme text and image prompt
+    chatResponse = openai.ChatCompletion.create(
+        model=text_model,  # Use the variable for the model
+        messages=conversation,
+        temperature=temperature,
+    )
+
+    # Parse meme details
+    memeDict = parse_meme(chatResponse)
+    image_prompt = memeDict['image_prompt']
+    meme_text = memeDict['meme_text']
+
+    # Print the meme text and image prompt
+    print("\n   Meme Text:  " + meme_text)
+    print("   Image Prompt:  " + image_prompt)
+
+    # Send image prompt to image generator and get image back
+    print("\nSending image creation request...")
+    virtual_image_file = image_generation_request(apiKeys, image_prompt, image_platform, openai_api, stability_api)
+
+    # Set file path for saving the meme
+    filePath, fileName = set_file_path(base_file_name, output_folder)
+
+    # Ensure output folder exists
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"Created output folder: {output_folder}")
+
+    # Generate the meme image with text
+    virtualMemeFile = create_meme(virtual_image_file, meme_text, filePath, noFileSave=noFileSave, fontFile=font_file)
+
+    # Convert virtual meme file to PIL image to add watermark
+    pil_image = Image.open(virtualMemeFile)
+
+    # Add watermark to the image
+    watermarked_image = add_watermark(pil_image, watermark_text=watermark_text, font_path=font_file, font_size=30)
+
+    # Save the watermarked image if noFileSave is False
+    if not noFileSave:
+        watermarked_image.save(filePath)
+
+        # Log details about the meme generated
+        write_log_file(userEnteredPrompt, memeDict, filePath, output_folder, basic_instructions, image_special_instructions, image_platform)
+
+    absoluteFilePath = os.path.abspath(filePath)
+
+    return {
+        "meme_text": meme_text,
+        "image_prompt": image_prompt,
+        "file_path": absoluteFilePath,
+        "virtual_meme_file": virtualMemeFile,
+        "file_name": fileName
+    }
+
+def generate_memes(meme_count, openai_api, text_model, userEnteredPrompt, conversation, temperature, 
+                   image_platform, stability_api, base_file_name, output_folder, 
+                   noFileSave, font_file, watermark_text):
     memeResultsDictsList = []
 
-    # CORE GENERATION LOOPS
+    # CORE GENERATION LOOP
     try:
-        
         for i in range(meme_count):
             print("\n----------------------------------------------------------------------------------------------------")
             print(f"Generating meme {i+1} of {meme_count}...")
-            memeInfoDict = single_meme_generation_loop()
+            memeInfoDict = single_meme_generation_loop(openai_api, text_model, userEnteredPrompt, 
+                                                       conversation, temperature, image_platform, 
+                                                       stability_api, base_file_name, output_folder, 
+                                                       noFileSave, font_file, watermark_text)
 
             # Add meme info dict to list of meme results
             memeResultsDictsList.append(memeInfoDict)
@@ -751,43 +867,66 @@ def generate(
         print("\n\nFinished. Output directory: " + os.path.abspath(output_folder))
         if not noUserInput:
             input("\nPress Enter to exit...")
-    
-    except MissingOpenAIKeyError as ox:
-        print(f"\n  ERROR:  {ox}")
-        if not noUserInput:
-            input("\nPress Enter to exit...")
-        sys.exit()
-        
-    except MissingAPIKeyError as ax:
-        print(f"\n  ERROR:  {ax}")
-        if not noUserInput:
-            input("\nPress Enter to exit...")
-        sys.exit()
-        
-    except openai.error.InvalidRequestError as irx:
-        print(f"\n  ERROR:  {irx}")
-        if "The model" in str(irx) and "does not exist" in str(irx):
-            #if 'gpt-4' in str(irx):
-            if str(irx) == "The model `gpt-4` does not exist":
-                print("  (!) Note: This error actually means you do not have access to the GPT-4 model yet.")
-                print("  (!)       - You can see more about the current GPT-4 requirements here: https://help.openai.com/en/articles/7102672-how-can-i-access-gpt-4")
-                print("  (!)       - Also ensure your country is supported: https://platform.openai.com/docs/supported-countries")
-                print("  (!)       - You can try the 'gpt-3.5-turbo' model instead. See more here: https://platform.openai.com/docs/models/overview)")
-            else:
-                print("   > Either the model name is incorrect, or you do not have access to it.")
-                print("   > See this page to see the model names to use in the API: https://platform.openai.com/docs/models/overview")
-        if not noUserInput:
-            input("\nPress Enter to exit...")
-        sys.exit()
-    
-    except Exception as ex:
-        print(f"\n  ERROR:  An error occurred while generating the meme. Error: {ex}")
-        if not noUserInput:
-            input("\nPress Enter to exit...")
-        sys.exit()
-    
-    # If called from command line, will return the list of meme results
+
+    except openai.error.InvalidRequestError as ire:
+        print(f"Invalid request: {ire}")
+    except openai.error.AuthenticationError as ae:
+        print(f"Authentication error: {ae}")
+    except openai.error.PermissionError as pe:
+        print(f"Permission error: {pe}")
+    except openai.error.RateLimitError as rle:
+        print(f"Rate limit exceeded: {rle}")
+    except openai.error.APIConnectionError as ace:
+        print(f"API connection error: {ace}")
+    except openai.error.Timeout as te:
+        print(f"Request timed out: {te}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
     return memeResultsDictsList
 
+def handle_not_found_error(nfx):
+    print(f"\n  ERROR:  {nfx}")
+    if "The model" in str(nfx) and "does not exist" in str(nfx):
+        if str(nfx) == "The model `gpt-4` does not exist":
+            print("  (!) Note: This error means you do not have access to the GPT-4 model yet.")
+            print("  (!)       - You can see more about the current GPT-4 requirements here: https://help.openai.com/en/articles/7102672-how-can-i-access-gpt-4")
+            print("  (!)       - Ensure your country is supported: https://platform.openai.com/docs/supported-countries")
+            print("  (!)       - You can try the 'gpt-3.5-turbo' model instead.")
+        else:
+            print("   > Either the model name is incorrect, or you do not have access to it.")
+            print("   > See the model names to use in the API: https://platform.openai.com/docs/models/overview")
+    if not noUserInput:
+        input("\nPress Enter to exit...")
+
 if __name__ == "__main__":
-    generate()
+    # Assuming other necessary variables (like api keys) are defined
+    meme_count = 1 # for example
+    openai_api = None
+    text_model = "gpt-3.5-turbo"  # or whatever model you want to use
+    userEnteredPrompt = "Sun and moon are talking the poltics"
+    conversation = [  {
+        "role": "system",
+        "content": "You are a helpful assistant that generates memes."
+    },
+    {
+        "role": "user",
+        "content": "Can you create a meme about programming?"
+    },
+    {
+        "role": "assistant",
+        "content": "Sure! What kind of programming meme do you want?"
+    },
+    {
+        "role": "user",
+        "content": "Something funny about Python!"
+    }]  # Assuming you initialize this properly
+    temperature = 0.7
+    image_platform = "open_ai"
+    stability_api = None
+    base_file_name = "meme"
+    output_folder = "output"
+    noFileSave = False
+    font_file = "arial.ttf"
+    watermark_text = "Your Watermark"
+    generate_memes(meme_count, openai_api, text_model, userEnteredPrompt, conversation, temperature, image_platform, stability_api, base_file_name, output_folder, noFileSave, font_file, watermark_text)
